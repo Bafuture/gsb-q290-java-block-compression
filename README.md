@@ -30,3 +30,69 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 290）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 实现说明（分支 A）
+
+包：`com.example.gsb.blockio`（`src/main/java/com/example/gsb/blockio`），仅依赖 JDK（DEFLATE 内置），测试用 JUnit 5 + AssertJ。
+
+### 核心类型
+
+| 类型 | 职责 |
+|------|------|
+| `ChunkArchiveWriter` | 流式写入：数据按固定块大小（默认 64 KiB，可配置）缓冲，满块立即用 DEFLATE 压缩并落盘，同时记录索引条目（压缩偏移、压缩长度、原始长度、CRC32）；`close()` 追加索引段与尾部（footer），关闭后文件立即可读。 |
+| `ChunkArchiveReader` | 随机读取：从尾部解析索引，`read(offset, length)` 按块大小换算出重叠的块号区间，只 `FileChannel` 定位读取并解压这些块，结果按偏移精确拼接。 |
+| `ChunkEntry` / `ChunkIndex` | 索引条目与整份索引（每块压缩偏移、压缩/原始长度、CRC32）。 |
+| `BlockCodec` / `DeflateCodec` | 每块压缩算法抽象与默认 DEFLATE 实现（codec id=0，写入 footer）。 |
+| `ChunkCorruptedException` | 解压失败或 CRC32 不匹配时抛出，携带块号 `chunkIndex()`，可精确定位损坏块。 |
+| `ChunkSizeTradeoff` | 块大小权衡基准（含 `main` 可直接运行打印表格）。 |
+
+### 文件格式（大端序）
+
+```
+[ 块记录 ] × N            块记录 = u32 'CHNK' + u32 压缩长度 + u32 原始长度 + u64 CRC32 + 压缩载荷
+[ 索引 ]   每条 24 字节   i64 压缩偏移 + i32 压缩长度 + i32 原始长度 + u64 CRC32
+[ footer ] 共 32 字节     i64 索引偏移 + i32 块数 + i32 块大小 + i64 原始总长 + i32 codec id + u32 'BLKA'
+```
+
+### 关键设计
+
+- **随机定位**：footer 固定 32 字节在文件末尾，一次定位即可读到全部索引；读取任何范围都只访问重叠块的压缩区间，绝不触碰其它块。
+- **跨块拼接**：范围两端的块只截取需要的片段（`max(0, offset-chunkStart)` 到 `min(chunkLen, end-chunkStart)`），中间块整体复制，边界字节不重复、不遗漏；测试对 1~3 倍块大小的 300 组随机区间逐字节校验。
+- **校验和**：每块存原始字节的 CRC32，解压后重算比对；解压异常、长度不符、CRC 不符统一包装为带块号的 `ChunkCorruptedException`；损坏块不影响其它块读取。
+- **并发**：`FileChannel.read(buf, position)` 位置读互不阻塞，解压在线程池并行；每块用 `ConcurrentHashMap<Integer, CompletableFuture>` 去重，同一块的并发请求共享同一次解压（只解压一次），解压结果默认缓存。`open(path, executor, codec, cacheChunks)` 可关闭缓存（顺序扫描大文件时避免缓存膨胀），关闭后仍对同一块的在途请求去重。
+
+### 块大小权衡数据
+
+实测（2 MiB 高可压缩文本，100 次 512 字节随机读，冷缓存，机器相关仅作相对比较；由 `ChunkSizeTradeoffTest` 生成）：
+
+| 块大小 | 压缩率 | 压缩后大小 | 索引大小 | 块数 | 随机读平均耗时 | 每次读取平均解压字节 |
+|-------:|-------:|-----------:|---------:|-----:|---------------:|--------------------:|
+| 4 KiB | 0.1998 | 418,934 | 12,320 B | 512 | 70 µs | 4,547 B |
+| 16 KiB | 0.1578 | 331,017 | 3,104 B | 128 | 54 µs | 16,384 B |
+| 64 KiB | 0.1425 | 298,753 | 800 B | 32 | 108 µs | 65,536 B |
+| 256 KiB | 0.1381 | 289,566 | 224 B | 8 | 436 µs | 262,144 B |
+| 1 MiB | 0.1368 | 286,986 | 80 B | 2 | 1,437 µs | 1,048,576 B |
+
+结论：块越大压缩率越好（1 MiB 比 4 KiB 省约 31% 空间）但随机小读要整块解压、耗时随块大小线性上升（1 MiB 块读 512 字节需解压 1 MiB）；块越小随机读越便宜但压缩率和索引开销变差。64 KiB 是压缩率（差距已收窄到个位数）与随机读成本之间的折中默认值。
+
+### 用法
+
+```java
+// 流式写入
+try (ChunkArchiveWriter w = new ChunkArchiveWriter(Files.newOutputStream(path), 64 * 1024)) {
+    w.write(data);
+} // close 后立即可随机读取
+
+// 随机 / 跨块读取（只解压重叠块）
+try (ChunkArchiveReader r = ChunkArchiveReader.open(path)) {
+    byte[] part = r.read(10_000_000L, 4096);
+}
+```
+
+### 验证
+
+```bash
+mvn -q verify      # 或 ./mvnw -q verify；27 个测试全部通过
+```
+
+测试覆盖：分块压缩往返（0/边界/跨块等 11 种尺寸）、索引偏移长度与 CRC 一致性、300 组随机区间与跨块边界拼接、仅解压所需块统计、流式写入期间索引增长、损坏块定位与邻块可读、16 线程同块只解压一次 / 200 请求 32 块并行正确且每块一次 / 慢解压验证不同块并行不互相阻塞、块大小权衡表格及排序断言。
