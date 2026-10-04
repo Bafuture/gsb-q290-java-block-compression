@@ -30,3 +30,63 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 290）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（本次交付）
+
+包 `com.example.gsb.blockzip`，仅依赖 JDK（`java.util.zip` DEFLATE），无第三方运行时依赖。
+
+### 文件格式
+
+```
+[0..7]    魔数 "BLKZ0001"
+[8..11]   int 块大小
+...       各块原始 DEFLATE 压缩数据，依次排列
+索引区    int 块数, long 原始总长度,
+          每块: long 压缩偏移, int 压缩长度, int 原始长度, long CRC-32
+文件尾    long 索引区偏移, 魔数 "BLKZEND1"
+```
+
+### API 一览
+
+- `BlockCompressedWriter(Path, int blockSize)`：流式写入器（`OutputStream`）。数据攒满一块即压缩落盘并记录索引；`close()` 冲刷最后一块并写入索引与文件尾，之后立即可随机读取。
+- `BlockCompressedReader(Path[, int maxCachedBlocks])`：随机访问读取器。`read(offset, length)` 只解压与请求相交的块；跨块自动拼接；每块解压后校验 CRC-32，损坏时抛出携带块序号的 `CorruptBlockException`。
+- 并发：底层用 `FileChannel` 位置无关读取，不同块解压互不阻塞；同一块的并发请求通过每块一个 `CompletableFuture` 去重，只解压一次；解压结果按块 LRU 缓存。
+
+### 用法示例
+
+```java
+// 写入（流式）
+try (BlockCompressedWriter w = new BlockCompressedWriter(path, 64 * 1024)) {
+    w.write(chunk1);
+    w.write(chunk2, 0, n);
+} // close 后即可读
+
+// 随机读取
+try (BlockCompressedReader r = new BlockCompressedReader(path)) {
+    byte[] middle = r.read(1_000_000, 4096); // 只解压相交的块
+}
+```
+
+### 块大小权衡（实测数据）
+
+测试：4 MiB 半可压缩文本，随机读取 4 KiB × 300 次取平均（缓存容量 1，强制每次真实解压）。数据由 `BlockSizeTradeoffTest` 在 `mvn verify` 时实测打印。
+
+| 块大小 | 压缩后大小 | 压缩率 | 随机读均耗时 | 解压块数/读 |
+|--------|-----------|--------|--------------|-------------|
+| 4 KiB  | 339,123 B | 8.1%   | ~10 µs       | 2.00        |
+| 16 KiB | 191,669 B | 4.6%   | ~13 µs       | 1.25        |
+| 64 KiB | 145,202 B | 3.5%   | ~30 µs       | 1.06        |
+| 256 KiB| 131,415 B | 3.1%   | ~90 µs       | 1.02        |
+| 1 MiB  | 127,784 B | 3.0%   | ~300 µs      | 1.00        |
+
+结论：块越大，DEFLATE 上下文越多，压缩率越好，但每次随机读需解压的无关数据越多、耗时近似线性增长；块越小随机读越快，但压缩率变差且 4 KiB 读取平均要解压 2 个块。64 KiB（默认值）在两者间较均衡。
+
+### 测试
+
+18 个测试覆盖：分块压缩与索引生成、流式写入、随机与跨块读取、只解压相交块、CRC-32 损坏检测与块定位、截断/非法文件报错、并发读取正确性与同块去重、块大小权衡基准。
+
+```bash
+mvn -q verify
+```
